@@ -1,0 +1,11 @@
+[build]
+builder        = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType       = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# Mount a persistent volume at /data so the SQLite database survives redeploys.
+# Create a Volume named "swiggy-bot-data" in Railway → your service → Volumes
+# and set mount path to /data

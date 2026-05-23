@@ -5,6 +5,7 @@ Swiggy Offer Telegram Bot
 • 2 credits per offer run (20 requests)
 • Recharge: 40 credits = ₹20 via UPI
 • Admin: /addcredits USER_ID AMOUNT  |  /pending  |  /approve ID  |  /reject ID
+• Single live-editing progress message (no spam)
 """
 
 import asyncio
@@ -19,14 +20,15 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     BotCommand,
+    Message,
 )
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
     ContextTypes,
     filters,
 )
@@ -35,19 +37,18 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 import database as db
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
-ADMIN_ID    = int(os.environ["ADMIN_ID"])          # your Telegram numeric ID
-ADMIN_UPI   = os.environ.get("ADMIN_UPI", "yourname@upi")
-TARGET_URL  = "https://lookupinfo.in/swiggy/json.php"
-FREE_CREDITS    = 2
-COST_PER_RUN    = 2
+BOT_TOKEN        = os.environ["BOT_TOKEN"]
+ADMIN_ID         = int(os.environ["ADMIN_ID"])
+ADMIN_UPI        = os.environ.get("ADMIN_UPI", "yourname@upi")
+TARGET_URL       = "https://lookupinfo.in/swiggy/json.php"
+FREE_CREDITS     = 2
+COST_PER_RUN     = 2
 RECHARGE_CREDITS = 40
-RECHARGE_PRICE  = "₹20"
-REQUIRED_KEYS   = {"token", "tid", "sid", "deviceId", "customerId", "mobile"}
+RECHARGE_PRICE   = "₹20"
+REQUIRED_KEYS    = {"token", "tid", "sid", "deviceId", "customerId", "mobile"}
 
-# ConversationHandler states
-WAIT_JSON   = 1
-WAIT_UTR    = 2
+# Spinner frames for animated progress
+SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -60,12 +61,17 @@ logger = logging.getLogger(__name__)
 
 def main_menu_kb(credits: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Run Offer (2 credits)", callback_data="run_offer")],
-        [InlineKeyboardButton(f"💳 Add Credits  |  Balance: {credits} 🪙", callback_data="add_credits")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")],
-        [InlineKeyboardButton("ℹ️ How it works", callback_data="how_it_works")],
+        [InlineKeyboardButton("🚀 Run Offer  (2 credits)", callback_data="run_offer")],
+        [InlineKeyboardButton(f"💳 Add Credits  │  🪙 {credits} credits", callback_data="add_credits")],
+        [InlineKeyboardButton("📊 My Stats", callback_data="my_stats"),
+         InlineKeyboardButton("ℹ️ How it works", callback_data="how_it_works")],
     ])
 
+def run_again_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Start New Process", callback_data="run_offer")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")],
+    ])
 
 def recharge_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -74,12 +80,10 @@ def recharge_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
     ])
 
-
 def back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_main")]
     ])
-
 
 def admin_recharge_kb(recharge_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
@@ -103,31 +107,40 @@ def validate_json(text: str) -> tuple[bool, dict | str]:
     return True, data
 
 
-def esc(text: str) -> str:
-    """Escape MarkdownV2 special chars."""
-    for ch in r"\_*[]()~`>#+-=|{}.!":
-        text = text.replace(ch, f"\\{ch}")
-    return text
+async def safe_edit(msg: Message, text: str, reply_markup=None, parse_mode=ParseMode.MARKDOWN):
+    """Edit a message, ignoring 'message not modified' errors."""
+    try:
+        await msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("edit failed: %s", e)
+    except Exception as e:
+        logger.warning("edit failed: %s", e)
 
 
 async def safe_send(bot, chat_id: int, text: str, **kwargs):
     try:
-        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
     except Exception as e:
         logger.warning("safe_send failed: %s", e)
+        return None
+
+
+def progress_bar(done: int, total: int = 20, width: int = 12) -> str:
+    filled = int(width * done / total)
+    bar = "█" * filled + "░" * (width - filled)
+    pct = int(100 * done / total)
+    return f"[{bar}] {done}/{total}  ({pct}%)"
 
 
 # ── Playwright (optimised) ─────────────────────────────────────────────────────
 
-async def run_offer_browser(json_text: str, status_cb) -> dict:
+async def run_offer_browser(json_text: str, progress_cb) -> dict:
     """
-    Optimised flow:
-    1. Open page (networkidle)          — concurrent with dismissing popup
-    2. Dismiss popup
-    3. Fill JSON + click Login
-    4. Check Balance
-    5. Start Offer Requests (20x)
-    6. Poll for completion (2 s intervals)
+    progress_cb(stage, done, total) — called on every update so the
+    caller can edit a single Telegram message in-place.
+
+    Stages: 'init' | 'login' | 'running' | 'done' | 'error' | 'not_eligible'
     """
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -139,7 +152,7 @@ async def run_offer_browser(json_text: str, status_cb) -> dict:
                 "--disable-gpu",
                 "--no-first-run",
                 "--no-zygote",
-                "--single-process",          # faster startup in Docker
+                "--single-process",
             ],
         )
         ctx = await browser.new_context(
@@ -154,46 +167,38 @@ async def run_offer_browser(json_text: str, status_cb) -> dict:
         )
         page = await ctx.new_page()
 
-        # Block heavy assets → faster page load
+        # Block heavy assets → faster load
         await page.route(
             "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,otf,mp4,mp3}",
             lambda r: r.abort(),
         )
 
         try:
-            await status_cb("🌐 Opening page…")
+            await progress_cb("init", 0, 20)
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20_000)
 
-            # ── Dismiss popup ────────────────────────────────────────────────
-            await status_cb("🪟 Dismissing popup…")
+            # Dismiss popup
             try:
                 popup_btn = page.get_by_role("button", name=re.compile(r"Got it", re.I))
                 await popup_btn.wait_for(state="visible", timeout=6_000)
                 await popup_btn.click()
             except PWTimeout:
-                pass  # no popup
+                pass
 
-            # ── Paste JSON ────────────────────────────────────────────────────
-            await status_cb("📋 Pasting credentials…")
+            # Paste JSON
             textarea = page.locator("textarea").first
             await textarea.wait_for(state="visible", timeout=8_000)
             await textarea.fill(json_text)
 
-            # ── Login ─────────────────────────────────────────────────────────
-            await status_cb("🔐 Logging in…")
+            # Login
+            await progress_cb("login", 0, 20)
             login_btn = page.get_by_role("button", name=re.compile(r"Login with JSON", re.I))
             await asyncio.gather(
                 login_btn.click(),
                 page.wait_for_selector("text=Login Successful", timeout=12_000),
             )
 
-            # grab mobile from page
-            body_snap = await page.inner_text("body")
-            mob_m = re.search(r"\b(9\d{9}|[6-9]\d{9})\b", body_snap)
-            mobile_str = mob_m.group(1) if mob_m else "?"
-            await status_cb(f"✅ Logged in! Mobile: `{mobile_str}`")
-
-            # post-login popup
+            # Post-login popup
             try:
                 pp = page.get_by_role("button", name=re.compile(r"Got it", re.I))
                 await pp.wait_for(state="visible", timeout=3_000)
@@ -201,49 +206,58 @@ async def run_offer_browser(json_text: str, status_cb) -> dict:
             except PWTimeout:
                 pass
 
-            # ── Check Balance ─────────────────────────────────────────────────
-            await status_cb("💰 Checking balance…")
+            # Grab mobile
+            body_snap = await page.inner_text("body")
+            mob_m = re.search(r"\b([6-9]\d{9})\b", body_snap)
+            mobile_str = mob_m.group(1) if mob_m else "?"
+
+            # Check Balance
             cb_btn = page.get_by_role("button", name=re.compile(r"Check Balance", re.I))
             await cb_btn.wait_for(state="visible", timeout=8_000)
             await cb_btn.click()
-            await page.wait_for_timeout(1_200)
+            await page.wait_for_timeout(1_000)
 
             bal_body = await page.inner_text("body")
-            bal_amounts = re.findall(r"₹\s*\d+", bal_body)
-            bal_str = " | ".join(dict.fromkeys(bal_amounts)) if bal_amounts else "N/A"
-            await status_cb(f"💰 Balance: {bal_str}")
+            bal_amounts = list(dict.fromkeys(re.findall(r"₹\s*\d+", bal_body)))
+            # Remove site-wide counters (very large numbers like ₹375500)
+            bal_relevant = [b for b in bal_amounts if int(re.search(r"\d+", b).group()) < 10000]
+            bal_str = " | ".join(bal_relevant) if bal_relevant else " | ".join(bal_amounts[:2])
 
-            # ── Start Offers ──────────────────────────────────────────────────
-            await status_cb("🚀 Starting 20 offer requests…")
+            # Start Offers
             start_btn = page.get_by_role("button", name=re.compile(r"Start Offer Requests", re.I))
             await start_btn.wait_for(state="visible", timeout=8_000)
             await start_btn.click()
 
-            # ── Monitor ───────────────────────────────────────────────────────
-            last_prog = ""
+            await progress_cb("running", 0, 20, mobile=mobile_str, balance=bal_str)
+
+            # Monitor
+            last_done = 0
+            spin_i = 0
             for tick in range(90):
-                await page.wait_for_timeout(1_500)   # 1.5s poll (was 2s)
+                await page.wait_for_timeout(1_500)
                 body = await page.inner_text("body")
 
                 prog_m = re.search(r"(\d+)\s*/\s*20", body)
-                if prog_m:
-                    prog = f"{prog_m.group(1)}/20"
-                    if prog != last_prog:
-                        last_prog = prog
-                        await status_cb(f"📊 {prog} requests done…")
+                done = int(prog_m.group(1)) if prog_m else last_done
+
+                if done != last_done or tick % 3 == 0:
+                    last_done = done
+                    spin_i = (spin_i + 1) % len(SPINNER)
+                    await progress_cb("running", done, 20,
+                                      mobile=mobile_str, balance=bal_str,
+                                      spinner=SPINNER[spin_i])
 
                 if re.search(r"Process Complete|All 20 offer requests processed", body, re.I):
                     break
                 if re.search(r"Not Eligible", body, re.I):
-                    return {"success": True, "not_eligible": True, "body": body}
+                    return {"success": True, "not_eligible": True}
 
-            # ── Collect results ───────────────────────────────────────────────
+            # Collect results
             final = await page.inner_text("body")
             requests = list(dict.fromkeys(
                 re.findall(r"Request #\d+ ✓ Success — Receiver: .+", final)
             ))
             success_cnt = len(requests)
-            failed_cnt  = len(re.findall(r"FAILED|\d+\nFAILED", final))
 
             earned_m = re.search(r"Total Earned[:\s]+₹\s*(\d+)", final)
             per_m    = re.search(r"Per Interaction[:\s]+₹\s*(\d+)", final)
@@ -254,10 +268,12 @@ async def run_offer_browser(json_text: str, status_cb) -> dict:
                 "success": True,
                 "not_eligible": False,
                 "success_cnt": success_cnt,
-                "failed_cnt": failed_cnt,
+                "failed_cnt": 20 - success_cnt,
                 "total_earned": total_earned,
                 "per_interaction": per_interaction,
                 "requests": requests,
+                "mobile": mobile_str,
+                "balance": bal_str,
             }
 
         except Exception as exc:
@@ -267,30 +283,27 @@ async def run_offer_browser(json_text: str, status_cb) -> dict:
             await browser.close()
 
 
-# ── Bot command/callback handlers ─────────────────────────────────────────────
+# ── Bot handlers ───────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    row  = db.upsert_user(user.id, user.username, user.full_name)
+    user    = update.effective_user
+    db.upsert_user(user.id, user.username, user.full_name)
     granted = db.give_free_credits(user.id, FREE_CREDITS)
+    credits = db.get_credits(user.id)
 
     greeting = (
         f"👋 Welcome back, *{user.first_name}*!" if not granted
-        else f"👋 Hey *{user.first_name}*! You just got *{FREE_CREDITS} free credits* 🎁"
+        else f"🎁 Hey *{user.first_name}*\\! You got *{FREE_CREDITS} free credits* to start\\!"
     )
-    credits = db.get_credits(user.id)
-
     await update.message.reply_text(
         f"{greeting}\n\n"
         f"🪙 Balance: *{credits} credits*\n"
-        f"💡 Each offer run costs *{COST_PER_RUN} credits* (20 requests)\n\n"
+        f"💡 Each offer run costs *{COST_PER_RUN} credits* \\(20 requests\\)\n\n"
         "What would you like to do?",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=main_menu_kb(credits),
     )
 
-
-# ── Callback: main menu buttons ────────────────────────────────────────────────
 
 async def cb_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
@@ -329,17 +342,18 @@ async def _cb_run_offer(q, ctx):
     if credits < COST_PER_RUN:
         await q.message.edit_text(
             f"❌ *Insufficient Credits*\n\n"
-            f"You have *{credits} credits* but need *{COST_PER_RUN}*.\n\n"
-            "Please recharge to continue:",
+            f"You have *{credits}* credits but need *{COST_PER_RUN}*.\n\n"
+            "Please recharge to continue 👇",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=recharge_kb(),
         )
         return
 
     await q.message.edit_text(
-        "📤 *Send me your Swiggy JSON credentials*\n\n"
-        "Required keys: `token · tid · sid · deviceId · customerId · mobile`\n\n"
-        "Just paste the JSON below 👇",
+        "📤 *Send your Swiggy JSON credentials*\n\n"
+        "Required keys:\n"
+        "`token · tid · sid · deviceId · customerId · mobile`\n\n"
+        "Paste the JSON below 👇",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_kb(),
     )
@@ -349,12 +363,12 @@ async def _cb_run_offer(q, ctx):
 async def _cb_add_credits(q, ctx):
     await q.message.edit_text(
         f"💳 *Recharge Credits*\n\n"
-        f"💰 *{RECHARGE_CREDITS} Credits = {RECHARGE_PRICE}*\n\n"
-        f"Send payment to UPI:\n`{ADMIN_UPI}`\n\n"
-        "After paying:\n"
-        "1️⃣ Copy the UPI ID above\n"
-        "2️⃣ Pay via any UPI app\n"
-        "3️⃣ Click *I Paid* and share your Transaction ID",
+        f"🏷  *{RECHARGE_CREDITS} Credits = {RECHARGE_PRICE}*\n\n"
+        f"📲 Pay to UPI ID:\n`{ADMIN_UPI}`\n\n"
+        "Steps:\n"
+        "1️⃣ Tap *Copy UPI ID* below\n"
+        "2️⃣ Open any UPI app & pay\n"
+        "3️⃣ Tap *I Paid* and send your Transaction ID",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=recharge_kb(),
     )
@@ -363,9 +377,9 @@ async def _cb_add_credits(q, ctx):
 async def _cb_i_paid(q, ctx):
     ctx.user_data["awaiting_utr"] = True
     await q.message.edit_text(
-        "🔢 *Submit Transaction ID*\n\n"
-        "Please send your *UPI Transaction ID / Reference Number* (UTR)\n\n"
-        "Example: `4239571234567` or `UPI123456789012`",
+        "🔢 *Enter Transaction ID*\n\n"
+        "Send your *UPI Transaction ID / UTR number*\n\n"
+        "Example: `4239571234567`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_kb(),
     )
@@ -377,10 +391,10 @@ async def _cb_stats(q, ctx):
     runs = db.user_run_count(uid)
     await q.message.edit_text(
         f"📊 *Your Stats*\n\n"
-        f"👤 Name: {user['full_name']}\n"
+        f"👤 {user['full_name']}\n"
         f"🪙 Credits: *{user['credits']}*\n"
-        f"🚀 Successful Runs: *{runs}*\n"
-        f"📅 Joined: {user['joined_at'][:10]}",
+        f"🚀 Completed Runs: *{runs}*\n"
+        f"📅 Joined: {str(user['joined_at'])[:10]}",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_kb(),
     )
@@ -389,17 +403,17 @@ async def _cb_stats(q, ctx):
 async def _cb_how(q, ctx):
     await q.message.edit_text(
         "ℹ️ *How It Works*\n\n"
-        "1️⃣ Each *offer run* sends 20 Swiggy requests automatically\n"
-        "2️⃣ Each run costs *2 credits*\n"
-        "3️⃣ New users get *2 free credits* to try once\n"
+        "1️⃣ Each run sends *20 Swiggy offer requests* automatically\n"
+        "2️⃣ Costs *2 credits* per run\n"
+        "3️⃣ New users get *2 free credits* on first start\n"
         "4️⃣ Recharge: *40 credits = ₹20* via UPI\n\n"
-        "💡 Typical result: ₹100 earned per run (₹5–10/request)",
+        "💡 Typical result: ₹100 earned per run",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_kb(),
     )
 
 
-# ── Admin approval callbacks ───────────────────────────────────────────────────
+# ── Admin callbacks ────────────────────────────────────────────────────────────
 
 async def _admin_approve(q, recharge_id: int):
     if q.from_user.id != ADMIN_ID:
@@ -407,21 +421,20 @@ async def _admin_approve(q, recharge_id: int):
         return
     row = db.resolve_recharge(recharge_id, "approved")
     if not row:
-        await q.answer("Recharge not found.", show_alert=True)
+        await q.answer("Not found.", show_alert=True)
         return
     new_bal = db.get_credits(row["user_id"])
     await q.message.edit_text(
-        q.message.text + f"\n\n✅ *APPROVED* — {row['credits_req']} credits added.",
+        q.message.text + f"\n\n✅ *APPROVED* — +{row['credits_req']} credits",
         parse_mode=ParseMode.MARKDOWN,
     )
     await safe_send(
-        q.get_bot(),
-        row["user_id"],
+        q.get_bot(), row["user_id"],
         f"🎉 *Recharge Approved!*\n\n"
-        f"✅ *+{row['credits_req']} credits* added to your account\n"
-        f"🪙 New balance: *{new_bal} credits*\n\n"
-        "Use /start to run offers!",
+        f"✅ *+{row['credits_req']} credits* added\n"
+        f"🪙 New balance: *{new_bal} credits*",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(new_bal),
     )
 
 
@@ -431,35 +444,32 @@ async def _admin_reject(q, recharge_id: int):
         return
     row = db.resolve_recharge(recharge_id, "rejected")
     if not row:
-        await q.answer("Recharge not found.", show_alert=True)
+        await q.answer("Not found.", show_alert=True)
         return
     await q.message.edit_text(
         q.message.text + "\n\n❌ *REJECTED*",
         parse_mode=ParseMode.MARKDOWN,
     )
     await safe_send(
-        q.get_bot(),
-        row["user_id"],
-        "❌ *Recharge Rejected*\n\n"
-        "Your payment could not be verified.\n"
-        "Please contact the admin if you believe this is an error.",
+        q.get_bot(), row["user_id"],
+        "❌ *Recharge Rejected*\n\nPayment could not be verified.\nContact admin if this is an error.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
-# ── Message handler (JSON input & UTR input) ───────────────────────────────────
+# ── Message handler ────────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (update.message.text or "").strip()
+    db.upsert_user(user.id, user.username, user.full_name)
 
-    # ── UTR flow ──────────────────────────────────────────────────────────────
+    # UTR flow
     if ctx.user_data.get("awaiting_utr"):
         ctx.user_data.pop("awaiting_utr")
         utr = text[:100]
         rid = db.create_recharge(user.id, user.username, utr)
         credits = db.get_credits(user.id)
-
         await update.message.reply_text(
             "✅ *Payment Submitted!*\n\n"
             f"🔢 UTR: `{utr}`\n"
@@ -469,42 +479,38 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_menu_kb(credits),
         )
-        # Notify admin
         now = datetime.now().strftime("%d %b %Y %H:%M")
         await safe_send(
-            ctx.bot,
-            ADMIN_ID,
-            f"💳 *New Recharge Request* #{rid}\n\n"
-            f"👤 User: [{user.full_name}](tg://user?id={user.id})\n"
-            f"🆔 User ID: `{user.id}`\n"
-            f"🔖 Username: @{user.username or 'N/A'}\n"
+            ctx.bot, ADMIN_ID,
+            f"💳 *New Recharge #{rid}*\n\n"
+            f"👤 [{user.full_name}](tg://user?id={user.id})\n"
+            f"🆔 `{user.id}`\n"
+            f"🔖 @{user.username or 'N/A'}\n"
             f"🔢 UTR: `{utr}`\n"
-            f"💰 Amount: {RECHARGE_PRICE}\n"
-            f"🪙 Credits: {RECHARGE_CREDITS}\n"
-            f"🕐 Time: {now}",
+            f"💰 {RECHARGE_PRICE}  →  {RECHARGE_CREDITS} credits\n"
+            f"🕐 {now}",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=admin_recharge_kb(rid),
         )
         return
 
-    # ── JSON flow ─────────────────────────────────────────────────────────────
+    # JSON flow
     if ctx.user_data.get("awaiting_json"):
         ctx.user_data.pop("awaiting_json")
         ok, result = validate_json(text)
         if not ok:
             credits = db.get_credits(user.id)
             await update.message.reply_text(
-                f"❌ *Invalid JSON*\n\n{result}\n\nPlease try again.",
+                f"❌ *Invalid JSON*\n\n{result}\n\nTry again:",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=main_menu_kb(credits),
             )
             return
 
-        # Final credit check
         if not db.deduct_credits(user.id, COST_PER_RUN):
             credits = db.get_credits(user.id)
             await update.message.reply_text(
-                f"❌ *Insufficient Credits* ({credits} remaining)\n\nPlease recharge:",
+                f"❌ *Not enough credits* ({credits} remaining)",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=recharge_kb(),
             )
@@ -512,81 +518,132 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         run_id  = db.start_run(user.id)
         credits = db.get_credits(user.id)
-        await update.message.reply_text(
-            f"✅ *JSON Validated — Run #{run_id} Started!*\n\n"
-            f"📱 Mobile: `{result.get('mobile','?')}`\n"
-            f"🪙 Credits used: *{COST_PER_RUN}* | Remaining: *{credits}*\n\n"
-            "I'll send live updates as the process runs ⚡",
+
+        # Send the ONE progress message we'll keep editing
+        live_msg = await update.message.reply_text(
+            _build_progress_text("init", 0, 20, run_id=run_id, credits=credits),
             parse_mode=ParseMode.MARKDOWN,
         )
+
         asyncio.create_task(
-            _run_and_notify(ctx.application, user.id, text, run_id)
+            _run_and_notify(ctx.application, user.id, text, run_id, credits, live_msg)
         )
         return
 
-    # ── Fallback ──────────────────────────────────────────────────────────────
+    # Fallback
     credits = db.get_credits(user.id)
-    db.upsert_user(user.id, user.username, user.full_name)
     await update.message.reply_text(
-        f"👋 Hi! Use the menu below.\n🪙 Balance: *{credits} credits*",
+        f"🪙 Balance: *{credits} credits*\n\nChoose an option:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu_kb(credits),
     )
 
 
-# ── Background offer runner ────────────────────────────────────────────────────
+# ── Progress text builder ──────────────────────────────────────────────────────
 
-async def _run_and_notify(app, chat_id: int, json_text: str, run_id: int):
-    async def status_cb(msg: str):
-        await safe_send(app.bot, chat_id, msg, parse_mode=ParseMode.MARKDOWN)
+def _build_progress_text(stage: str, done: int, total: int = 20, **kw) -> str:
+    run_id  = kw.get("run_id", "?")
+    credits = kw.get("credits", "?")
+    mobile  = kw.get("mobile", "")
+    balance = kw.get("balance", "")
+    spinner = kw.get("spinner", "⏳")
 
-    result = await run_offer_browser(json_text, status_cb)
+    header = f"🎯 *Offer Run #{run_id}*\n"
+    if mobile:
+        header += f"📱 Mobile: `{mobile}`\n"
+    if balance:
+        header += f"💰 Balance: `{balance}`\n"
+    header += f"🪙 Credits remaining: *{credits}*\n"
+    header += "─────────────────────\n"
 
+    if stage == "init":
+        return header + f"{spinner} *Initialising…*\nOpening page & logging in\\.\\.\\."
+
+    if stage == "login":
+        return header + f"{spinner} *Logging in…*\nAuthenticating your credentials\\.\\.\\."
+
+    if stage == "running":
+        bar = progress_bar(done, total)
+        pct = int(100 * done / total)
+        step_emoji = "🟢" if pct >= 75 else ("🟡" if pct >= 40 else "🔵")
+        return (
+            header +
+            f"{step_emoji} *Running Offer Requests*\n\n"
+            f"`{bar}`\n\n"
+            f"{spinner} Processing request {done}/{total}…"
+        )
+
+    return header + f"{spinner} Please wait…"
+
+
+# ── Background runner ──────────────────────────────────────────────────────────
+
+async def _run_and_notify(app, chat_id: int, json_text: str,
+                          run_id: int, credits: int, live_msg: Message):
+
+    spin_counter = [0]
+
+    async def progress_cb(stage, done, total=20, **kw):
+        spin_counter[0] = (spin_counter[0] + 1) % len(SPINNER)
+        kw.setdefault("spinner", SPINNER[spin_counter[0]])
+        kw.setdefault("run_id", run_id)
+        kw.setdefault("credits", credits)
+        text = _build_progress_text(stage, done, total, **kw)
+        await safe_edit(live_msg, text, parse_mode=ParseMode.MARKDOWN)
+
+    result = await run_offer_browser(json_text, progress_cb)
+    final_credits = db.get_credits(chat_id)
+
+    # ── Error ──────────────────────────────────────────────────────────────────
     if not result["success"]:
         db.finish_run(run_id, "failed", 0, 0, "N/A")
-        # Refund credits on browser error
-        db.add_credits(chat_id, COST_PER_RUN)
-        await safe_send(
-            app.bot, chat_id,
-            f"❌ *Offer run failed* (credits refunded)\n\n`{result.get('error','Unknown error')}`",
-            parse_mode=ParseMode.MARKDOWN,
+        db.add_credits(chat_id, COST_PER_RUN)   # refund
+        await safe_edit(
+            live_msg,
+            f"❌ *Run #{run_id} Failed*\n\n"
+            f"`{result.get('error','Unknown error')[:300]}`\n\n"
+            f"🔄 Credits refunded → 🪙 *{db.get_credits(chat_id)}*",
+            reply_markup=run_again_kb(),
         )
         return
 
+    # ── Not eligible ───────────────────────────────────────────────────────────
     if result.get("not_eligible"):
         db.finish_run(run_id, "not_eligible", 0, 0, "N/A")
-        credits = db.get_credits(chat_id)
-        await safe_send(
-            app.bot, chat_id,
-            f"❌ *Not Eligible*\n\n"
-            "This account is not eligible for offers right now.\n"
-            f"🪙 Your balance: *{credits} credits*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=main_menu_kb(credits),
+        await safe_edit(
+            live_msg,
+            f"⚠️ *Run #{run_id} — Not Eligible*\n\n"
+            "This account is not eligible for offers right now.\n\n"
+            f"🪙 Credits remaining: *{final_credits}*",
+            reply_markup=run_again_kb(),
         )
         return
 
+    # ── Success ────────────────────────────────────────────────────────────────
     db.finish_run(
         run_id, "done",
         result["success_cnt"], result["failed_cnt"],
         result["total_earned"],
     )
 
-    reqs_text = "\n".join(result["requests"][:20])
-    credits   = db.get_credits(chat_id)
+    reqs_lines = result["requests"][:20]
+    reqs_text  = "\n".join(reqs_lines) if reqs_lines else "No request log available."
 
-    await safe_send(
-        app.bot, chat_id,
-        f"🎉 *Offer Run Complete!* \\(Run \\#{run_id}\\)\n\n"
-        f"✅ Successful: `{result['success_cnt']}/20`\n"
-        f"❌ Failed: `{result['failed_cnt']}`\n"
-        f"💰 Total Earned: `{result['total_earned']}`\n"
-        f"💵 Per Interaction: `{result['per_interaction']}`\n\n"
-        f"```\n{reqs_text[:2800]}\n```\n\n"
-        f"🪙 Remaining Credits: *{credits}*",
-        parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=main_menu_kb(credits),
+    success_msg = (
+        f"✅ *Run #{run_id} Complete!*\n\n"
+        f"📱 Mobile: `{result.get('mobile','?')}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Successful : *{result['success_cnt']}/20*\n"
+        f"❌ Failed     : *{result['failed_cnt']}*\n"
+        f"💰 Earned     : *{result['total_earned']}*\n"
+        f"💵 Per Request: *{result['per_interaction']}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 Credits remaining: *{final_credits}*\n\n"
+        f"*Request Log:*\n"
+        f"```\n{reqs_text[:2500]}\n```"
     )
+
+    await safe_edit(live_msg, success_msg, reply_markup=run_again_kb())
 
 
 # ── Admin commands ─────────────────────────────────────────────────────────────
@@ -606,9 +663,9 @@ async def cmd_addcredits(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await safe_send(
         ctx.bot, uid,
-        f"🎉 *{amount} credits* have been added to your account by admin!\n"
-        f"🪙 New balance: *{new_bal} credits*",
+        f"🎉 *{amount} credits* added by admin!\n🪙 Balance: *{new_bal}*",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(new_bal),
     )
 
 
@@ -622,10 +679,9 @@ async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for row in rows:
         await update.message.reply_text(
             f"💳 *Recharge #{row['id']}*\n"
-            f"👤 User ID: `{row['user_id']}`\n"
-            f"🔖 @{row['username'] or 'N/A'}\n"
+            f"👤 `{row['user_id']}` @{row['username'] or 'N/A'}\n"
             f"🔢 UTR: `{row['utr']}`\n"
-            f"🕐 {row['created_at']}",
+            f"🕐 {str(row['created_at'])[:16]}",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=admin_recharge_kb(row["id"]),
         )
@@ -640,14 +696,15 @@ async def cmd_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rid = int(ctx.args[0])
     row = db.resolve_recharge(rid, "approved")
     if not row:
-        await update.message.reply_text("Recharge not found.")
+        await update.message.reply_text("Not found.")
         return
     new_bal = db.get_credits(row["user_id"])
-    await update.message.reply_text(f"✅ Approved #{rid} → +{row['credits_req']} credits to `{row['user_id']}`")
+    await update.message.reply_text(f"✅ Approved #{rid} → +{row['credits_req']} credits")
     await safe_send(
         ctx.bot, row["user_id"],
         f"🎉 *Recharge Approved!*\n+{row['credits_req']} credits\n🪙 Balance: *{new_bal}*",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(new_bal),
     )
 
 
@@ -660,23 +717,19 @@ async def cmd_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rid = int(ctx.args[0])
     row = db.resolve_recharge(rid, "rejected")
     if not row:
-        await update.message.reply_text("Recharge not found.")
+        await update.message.reply_text("Not found.")
         return
     await update.message.reply_text(f"❌ Rejected #{rid}")
-    await safe_send(
-        ctx.bot, row["user_id"],
-        "❌ Your recharge was rejected. Contact admin for help.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await safe_send(ctx.bot, row["user_id"],
+                    "❌ Recharge rejected. Contact admin for help.")
 
 
 async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show user their balance with menu."""
     user = update.effective_user
     db.upsert_user(user.id, user.username, user.full_name)
     credits = db.get_credits(user.id)
     await update.message.reply_text(
-        f"🪙 *Your Balance: {credits} credits*",
+        f"🪙 *Balance: {credits} credits*",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu_kb(credits),
     )
@@ -685,6 +738,7 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── App setup ──────────────────────────────────────────────────────────────────
 
 async def post_init(app: Application):
+    db.init_db()
     await app.bot.set_my_commands([
         BotCommand("start",      "Start the bot / main menu"),
         BotCommand("balance",    "Check your credit balance"),
@@ -700,10 +754,9 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .concurrent_updates(True)       # handle multiple users in parallel
+        .concurrent_updates(True)
         .build()
     )
-
     app.add_handler(CommandHandler("start",      cmd_start))
     app.add_handler(CommandHandler("balance",    cmd_balance))
     app.add_handler(CommandHandler("addcredits", cmd_addcredits))
